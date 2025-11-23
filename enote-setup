@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/enote"
+CONFIG_PATH="$CONFIG_DIR/config.json"
+
+if ! command -v gum >/dev/null 2>&1; then
+  echo "gum is required for setup. Install gum and re-run this script." >&2
+  exit 1
+fi
+
+# Detect shell profile for persistent environment variables and PATH updates.
+case "${SHELL:-}" in
+*/zsh)
+  PROFILE="$HOME/.zshrc"
+  ;;
+*/bash)
+  if [[ -f "$HOME/.bashrc" ]]; then
+    PROFILE="$HOME/.bashrc"
+  else
+    PROFILE="$HOME/.bash_profile"
+  fi
+  ;;
+*)
+  PROFILE="$HOME/.profile"
+  ;;
+esac
+
+export CONFIG_PATH
+eval "$(
+  CONFIG_PATH="$CONFIG_PATH" python3 - <<'PY'
+import json, os, shlex
+path = os.environ.get("CONFIG_PATH")
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception:
+    data = {}
+for key, val in data.items():
+    env_key = f"DEFAULT_{key.upper()}"
+    if isinstance(val, bool):
+        val = "yes" if val else "no"
+    print(f'export {env_key}={shlex.quote(str(val))}')
+PY
+)"
+
+require_input() {
+  local label="$1"
+  local default="${2:-}"
+  local value
+  while true; do
+    value=$(gum input --prompt "$label: " --value "$default")
+    if [[ -n "$value" ]]; then
+      echo "$value"
+      return
+    fi
+    if [[ -n "$default" ]]; then
+      echo "$default"
+      return
+    fi
+    gum style --foreground 1 "This value is required."
+  done
+}
+
+host=$(require_input "SMTP host" "${DEFAULT_SMTP_HOST:-}")
+port_raw=$(require_input "SMTP port" "${DEFAULT_SMTP_PORT:-587}")
+while ! [[ "$port_raw" =~ ^[0-9]+$ ]]; do
+  gum style --foreground 1 "Port must be a number."
+  port_raw=$(require_input "SMTP port" "${DEFAULT_SMTP_PORT:-587}")
+done
+
+starttls_default="${DEFAULT_USE_STARTTLS:-yes}"
+starttls_choice=$(echo -e "yes\nno" | gum choose --header "Use STARTTLS?" --selected "$starttls_default")
+
+smtp_user=$(gum input --prompt "SMTP username (leave blank for no auth): " --value "${DEFAULT_SMTP_USER:-}")
+smtp_password=""
+if [[ -n "$smtp_user" ]]; then
+  password_prompt="SMTP password (stored as persistent env var)"
+  smtp_password=$(gum input --password --prompt "$password_prompt: ")
+fi
+
+to_email=$(require_input "Recipient email" "${DEFAULT_TO_EMAIL:-}")
+from_email_default="${DEFAULT_FROM_EMAIL:-$to_email}"
+from_email=$(require_input "From email" "$from_email_default")
+subject_prefix=$(require_input "Subject prefix" "${DEFAULT_SUBJECT_PREFIX:-Note}")
+
+gum confirm "Save settings to $CONFIG_PATH?" || exit 1
+
+# Persist SMTP password as a shell environment variable, if provided.
+if [[ -n "$smtp_password" ]]; then
+  # Use printf %q to safely escape special characters in the password.
+  escaped_pw=$(printf '%q' "$smtp_password")
+  echo "export ENOTE_SMTP_PASSWORD=$escaped_pw" >>"$PROFILE"
+  echo "Saved SMTP password as ENOTE_SMTP_PASSWORD in $PROFILE"
+fi
+
+export ENOTE_SMTP_HOST="$host"
+export ENOTE_SMTP_PORT="$port_raw"
+export ENOTE_SMTP_USER="$smtp_user"
+export ENOTE_USE_STARTTLS="$starttls_choice"
+export ENOTE_TO_EMAIL="$to_email"
+export ENOTE_FROM_EMAIL="$from_email"
+export ENOTE_SUBJECT_PREFIX="$subject_prefix"
+
+CONFIG_DIR="$CONFIG_DIR" CONFIG_PATH="$CONFIG_PATH" python3 - <<'PY'
+import json, os
+
+config = {
+    "smtp_host": os.environ["ENOTE_SMTP_HOST"],
+    "smtp_port": int(os.environ["ENOTE_SMTP_PORT"]),
+    "smtp_user": os.environ.get("ENOTE_SMTP_USER", ""),
+    "use_starttls": os.environ.get("ENOTE_USE_STARTTLS", "yes").lower().startswith("y"),
+    "to_email": os.environ["ENOTE_TO_EMAIL"],
+    "from_email": os.environ["ENOTE_FROM_EMAIL"],
+    "subject_prefix": os.environ["ENOTE_SUBJECT_PREFIX"],
+}
+
+config_dir = os.environ["CONFIG_DIR"]
+config_path = os.environ["CONFIG_PATH"]
+os.makedirs(config_dir, exist_ok=True)
+with open(config_path, "w", encoding="utf-8") as fh:
+    json.dump(config, fh, indent=2)
+os.chmod(config_path, 0o600)
+print(f"Saved config to {config_path}")
+PY
+
+# Ensure enote is on PATH by symlinking into ~/.local/bin and updating shell profile if needed.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET_BIN="$HOME/.local/bin"
+TARGET_LINK="$TARGET_BIN/enote"
+
+mkdir -p "$TARGET_BIN"
+ln -sf "$SCRIPT_DIR/enote" "$TARGET_LINK"
+echo "Linked enote to $TARGET_LINK"
+
+if ! echo "$PATH" | tr ':' '\n' | grep -qx "$TARGET_BIN"; then
+  echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >>"$PROFILE"
+  echo "Added \$HOME/.local/bin to PATH in $PROFILE"
+else
+  echo "\$HOME/.local/bin already in PATH"
+fi
+
+echo "You may need to start a new shell or 'source' your profile (e.g., 'source \"$PROFILE\"') for 'enote' to be available."

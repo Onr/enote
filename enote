@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""
+Minimal enote CLI: first run sets up SMTP settings; subsequent runs send a note.
+Usage:
+  enote                 # triggers setup if no config, otherwise shows help
+  enote "message text"  # send message using saved settings
+  enote -e              # rerun setup to edit settings
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
+from datetime import datetime, timezone
+from email.message import EmailMessage
+from getpass import getpass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+import smtplib
+
+CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "enote" / "config.json"
+HISTORY_PATH = CONFIG_PATH.parent / "history.json"
+SETUP_SCRIPT = Path(__file__).resolve().parent / "enote-setup"
+
+
+def load_config() -> Optional[Dict[str, Any]]:
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    return None
+
+
+def save_config(config: Dict[str, Any]) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
+        json.dump(config, fh, indent=2)
+    os.chmod(CONFIG_PATH, 0o600)
+
+
+def run_gum_setup() -> Optional[Dict[str, Any]]:
+    if not SETUP_SCRIPT.exists():
+        print(f"Setup script not found at {SETUP_SCRIPT}")
+        return None
+    result = subprocess.run([str(SETUP_SCRIPT)], check=False)
+    if result.returncode != 0:
+        print("Setup did not complete. Please re-run `enote-setup` after installing gum.")
+        return None
+    return load_config()
+
+
+def send_email(config: Dict[str, Any], body: str) -> None:
+    message = EmailMessage()
+    message["Subject"] = config["subject_prefix"]
+    message["From"] = config["from_email"]
+    message["To"] = config["to_email"]
+    message.set_content(body)
+
+    try:
+        with smtplib.SMTP(config["smtp_host"], config["smtp_port"], timeout=30) as server:
+            server.ehlo()
+            if config.get("use_starttls"):
+                server.starttls()
+                server.ehlo()
+            if config.get("smtp_user"):
+                password = os.environ.get("ENOTE_SMTP_PASSWORD")
+                if not password:
+                    password = getpass("SMTP password (will not be stored by enote): ")
+                    if not password:
+                        print("No password entered; aborting.")
+                        sys.exit(1)
+                server.login(config["smtp_user"], password)
+            server.send_message(message)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Failed to send note: {exc}")
+        sys.exit(1)
+
+    print("Note sent successfully.")
+
+def load_history() -> List[Dict[str, Any]]:
+    if HISTORY_PATH.exists():
+        try:
+            with open(HISTORY_PATH, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except json.JSONDecodeError:
+            return []
+    return []
+
+def append_history(body: str) -> None:
+    entry = {
+        "timestamp": datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "body": body
+    }
+    history = load_history()
+    history.append(entry)
+    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(HISTORY_PATH, "w", encoding="utf-8") as fh:
+        json.dump(history, fh, indent=2)
+
+def print_history() -> None:
+    history = load_history()
+    if not history:
+        print("No history yet.")
+        return
+    for idx, entry in enumerate(history, 1):
+        ts = entry.get("timestamp", "unknown time")
+        body = entry.get("body", "")
+        print(f"{idx}. [{ts}] {body}")
+
+
+def summarize_body(body: str, width: int = 60) -> str:
+    first_line = ""
+    for line in body.splitlines():
+        if line.strip():
+            first_line = line.strip()
+            break
+    if not first_line:
+        first_line = "(empty note)"
+    return textwrap.shorten(first_line, width=width, placeholder="…")
+
+
+def display_full_note(entry: Dict[str, Any]) -> None:
+    ts = entry.get("timestamp", "unknown time")
+    body = entry.get("body", "")
+    body_with_header = f"[{ts}]\n\n{body}"
+    gum_path = shutil.which("gum")
+    if gum_path:
+        try:
+            subprocess.run(
+                [gum_path, "pager"],
+                input=body_with_header.encode(),
+                check=False,
+            )
+            return
+        except OSError:
+            pass
+    print(body_with_header)
+
+
+def clear_history_interactive() -> None:
+    if not HISTORY_PATH.exists():
+        print("No history to delete.")
+        return
+
+    gum_path = shutil.which("gum")
+    if gum_path:
+        try:
+            result = subprocess.run(
+                [gum_path, "confirm", "Delete all notes?"],
+                check=False,
+            )
+        except OSError:
+            gum_path = None
+        else:
+            if result.returncode != 0:
+                print("Canceled.")
+                return
+
+    if gum_path is None:
+        response = input("Delete all notes? (y/N): ").strip().lower()
+        if response not in {"y", "yes"}:
+            print("Canceled.")
+            return
+
+    try:
+        HISTORY_PATH.unlink()
+        print("Deleted all notes.")
+    except OSError as exc:
+        print(f"Failed to delete history: {exc}")
+
+
+def list_history_interactive() -> None:
+    history = load_history()
+    if not history:
+        print("No history yet.")
+        return
+    gum_path = shutil.which("gum")
+
+    if gum_path:
+        options: List[str] = []
+        for idx, entry in enumerate(history, 1):
+            summary = summarize_body(entry.get("body", ""))
+            ts = entry.get("timestamp", "unknown time")
+            options.append(f"{idx}. {summary} ({ts})")
+        delete_all_index = len(history) + 1
+        options.append(f"{delete_all_index}. Delete all notes")
+
+        while True:
+            try:
+                proc = subprocess.run(
+                    [
+                        gum_path,
+                        "choose",
+                        "--header",
+                        "Select a note to view its full text (Esc/Ctrl+C to quit)",
+                        *options,
+                    ],
+                    stdout=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+            except OSError:
+                break
+
+            if not proc or proc.returncode != 0:
+                break
+
+            selection = (proc.stdout or "").strip()
+            if not selection:
+                break
+
+            try:
+                index = int(selection.split(".", 1)[0])
+            except ValueError:
+                continue
+
+            if index == delete_all_index:
+                # extra confirmation layer before invoking the normal clear flow
+                try:
+                    confirm_proc = subprocess.run(
+                        [
+                            gum_path,
+                            "confirm",
+                            "Really delete ALL notes? This cannot be undone.",
+                        ],
+                        check=False,
+                    )
+                except OSError:
+                    confirm_proc = None
+                if not confirm_proc or confirm_proc.returncode != 0:
+                    continue
+                clear_history_interactive()
+                return
+            if 1 <= index <= len(history):
+                display_full_note(history[index - 1])
+            # then loop back to allow choosing another note
+
+        return
+
+    # Fallback to simple numbered list + input if gum is not available or failed.
+    while True:
+        header = "Sent notes (enter a number to view, empty to cancel)"
+        print(header)
+
+        for idx, entry in enumerate(history, 1):
+            summary = summarize_body(entry.get("body", ""))
+            ts = entry.get("timestamp", "unknown time")
+            print(f"{idx}. {summary} ({ts})")
+
+        delete_all_index = len(history) + 1
+        print(f"{delete_all_index}. Delete all notes")
+
+        choice = input("Select note number (or blank to cancel): ").strip()
+        if not choice:
+            return
+        try:
+            index = int(choice)
+        except ValueError:
+            print("Please enter a valid number.")
+            continue
+        if index == delete_all_index:
+            confirm = input(
+                "Really delete ALL notes? This cannot be undone. Type 'DELETE' to confirm: "
+            ).strip()
+            if confirm != "DELETE":
+                print("Canceled.")
+                continue
+            clear_history_interactive()
+            return
+        if 1 <= index <= len(history):
+            display_full_note(history[index - 1])
+            return
+        print(f"Please enter a number between 1 and {delete_all_index}.")
+
+
+def read_message_from_file(path_str: str) -> str:
+    path = Path(path_str).expanduser()
+    if not path.is_file():
+        print(f"File not found: {path}")
+        sys.exit(1)
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"Failed to read {path}: {exc}")
+        sys.exit(1)
+
+
+def print_usage_hint() -> None:
+    print("Usage:")
+    print("  enote \"message\"   send a note with the saved settings")
+    print("  enote -f file      send contents of file")
+    print("  enote -l           list sent notes")
+    print("  enote -e           edit saved settings (opens gum setup)")
+    print("Run `enote` once to set up if you have not configured it yet (gum required).")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("-e", "--edit", action="store_true", help="edit saved settings")
+    parser.add_argument("-l", "--list", action="store_true", help="list sent notes")
+    parser.add_argument("-f", "--file", help="send contents of file instead of inline message")
+    parser.add_argument("message", nargs="?", help="message text to email")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    config = load_config()
+
+    if args.edit:
+        config = run_gum_setup()
+        if not (args.message or args.file or args.list):
+            return
+
+    if config is None:
+        config = run_gum_setup()
+
+    if config is None:
+        print("Configuration not available. Install gum and run `enote-setup`.")
+        sys.exit(1)
+
+    if args.list:
+        list_history_interactive()
+        return
+
+    message_body: Optional[str] = None
+    if args.file:
+        message_body = read_message_from_file(args.file)
+    elif args.message:
+        message_body = args.message
+
+    if not message_body:
+        print_usage_hint()
+        return
+
+    send_email(config, message_body)
+    append_history(message_body)
+
+
+if __name__ == "__main__":
+    main()
