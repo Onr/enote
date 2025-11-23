@@ -62,17 +62,21 @@ require_input() {
   done
 }
 
-host=$(require_input "SMTP host" "${DEFAULT_SMTP_HOST:-}")
-port_raw=$(require_input "SMTP port" "${DEFAULT_SMTP_PORT:-587}")
+gum style --foreground 4 "SMTP host is the address of the mail server that will send your notes.\nExamples:\n  - Gmail: smtp.gmail.com (requires an app password)\n  - Outlook/Office 365: smtp.office365.com\n  - Yahoo Mail: smtp.mail.yahoo.com\nCheck your email provider’s “SMTP settings” documentation if unsure."
+host=$(require_input "SMTP host (e.g. smtp.gmail.com)" "${DEFAULT_SMTP_HOST:-}")
+
+gum style --foreground 4 "SMTP port is the network port used to connect to the mail server.\nCommon values:\n  - 587: STARTTLS (recommended for most providers)\n  - 465: SSL/TLS\nCheck your provider’s docs and match whatever port they list for SMTP."
+port_raw=$(require_input "SMTP port (e.g. 587)" "${DEFAULT_SMTP_PORT:-587}")
 while ! [[ "$port_raw" =~ ^[0-9]+$ ]]; do
   gum style --foreground 1 "Port must be a number."
-  port_raw=$(require_input "SMTP port" "${DEFAULT_SMTP_PORT:-587}")
+  port_raw=$(require_input "SMTP port (e.g. 587)" "${DEFAULT_SMTP_PORT:-587}")
 done
 
 starttls_default="${DEFAULT_USE_STARTTLS:-yes}"
-starttls_choice=$(echo -e "yes\nno" | gum choose --header "Use STARTTLS?" --selected "$starttls_default")
+gum style --foreground 4 "STARTTLS upgrades a plain connection to an encrypted one.\nMost modern providers (Gmail, Outlook, Yahoo, etc.) expect STARTTLS on port 587.\nChoose “yes” unless your provider’s SMTP docs explicitly say otherwise."
+starttls_choice=$(echo -e "yes\nno" | gum choose --header "Use STARTTLS? (recommended: yes on port 587)" --selected "$starttls_default")
 
-smtp_user=$(gum input --prompt "SMTP username (leave blank for no auth): " --value "${DEFAULT_SMTP_USER:-}")
+smtp_user=$(gum input --prompt "SMTP username (usually your full email address; leave blank for no auth): " --value "${DEFAULT_SMTP_USER:-}")
 smtp_password=""
 if [[ -n "$smtp_user" ]]; then
   password_prompt="SMTP password (stored as persistent env var)"
@@ -141,3 +145,4 @@ else
 fi
 
 echo "You may need to start a new shell or 'source' your profile (e.g., 'source \"$PROFILE\"') for 'enote' to be available."
+echo "Example: enote \"Test note from enote\""

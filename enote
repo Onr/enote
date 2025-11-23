@@ -71,6 +71,17 @@ def send_email(config: Dict[str, Any], body: str) -> None:
                     if not password:
                         print("No password entered; aborting.")
                         sys.exit(1)
+                # smtplib expects ASCII-only credentials for most auth mechanisms.
+                try:
+                    config["smtp_user"].encode("ascii")
+                    password.encode("ascii")
+                except UnicodeEncodeError:
+                    print(
+                        "SMTP username and password must contain only basic ASCII characters.\n"
+                        "Please avoid smart quotes or non-breaking spaces; regenerate "
+                        "an ASCII-only app password if needed."
+                    )
+                    sys.exit(1)
                 server.login(config["smtp_user"], password)
             server.send_message(message)
     except Exception as exc:  # noqa: BLE001
